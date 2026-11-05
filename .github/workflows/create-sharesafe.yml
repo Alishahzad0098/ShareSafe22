@@ -1,1 +1,412 @@
+# ShareSafe Mini project creator — Team La Fabrica
+# Save as .github/workflows/create-sharesafe.yml on your default branch.
+# Then open Actions > Create ShareSafe > Run workflow.
+# The workflow WRITES the app from the code below. No checkout is needed.
+# Download ShareSafe-Generated from the completed run's Artifacts section.
+# This creates a smaller teaching app, not the full earlier ShareSafe prototype.
+
+name: Create ShareSafe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  create-project:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      # STEP 1: Prepare Python on GitHub's temporary computer.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # STEP 2: Write the backend, interface, tests, and setup instructions.
+      # Each quoted heredoc writes literal source code into a new file.
+      - name: Create the ShareSafe project files
+        shell: bash
+        run: |
+          mkdir -p ShareSafe/static ShareSafe/tests
+          cat > ShareSafe/app.py <<'SHARESAFE_FILE_0_END'
+          """ShareSafe Mini: local screenshot redaction for Team La Fabrica."""
+          import base64
+          import io
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import secrets
+          import shutil
+          import threading
+          
+          from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+          from fastapi.responses import FileResponse, Response
+          from fastapi.staticfiles import StaticFiles
+          from starlette.middleware.trustedhost import TrustedHostMiddleware
+          from PIL import Image, ImageDraw, ImageOps, UnidentifiedImageError
+          import pytesseract
+          
+          ROOT = Path(__file__).resolve().parent
+          TOKEN = secrets.token_urlsafe(32)
+          OCR_LOCK = threading.Lock()
+          Image.MAX_IMAGE_PIXELS = 12_000_000
+          for candidate in [os.getenv('TESSERACT_CMD'), shutil.which('tesseract'),
+                            r'C:\Program Files\Tesseract-OCR\tesseract.exe']:
+              if candidate and Path(candidate).is_file():
+                  pytesseract.pytesseract.tesseract_cmd = candidate
+                  break
+          
+          app = FastAPI(title='ShareSafe Mini')
+          app.add_middleware(TrustedHostMiddleware, allowed_hosts=['127.0.0.1', 'localhost', 'testserver'])
+          app.mount('/static', StaticFiles(directory=ROOT / 'static'), name='static')
+          
+          @app.middleware('http')
+          async def protect_local_app(request: Request, call_next):
+              if request.method == 'POST' and request.headers.get('X-ShareSafe-Token') != TOKEN:
+                  return Response('Invalid session token', status_code=403)
+              response = await call_next(request)
+              response.headers['Cache-Control'] = 'no-store'
+              response.headers['X-Content-Type-Options'] = 'nosniff'
+              response.headers['Content-Security-Policy'] = "default-src 'self'; img-src 'self' data: blob:; style-src 'self'; script-src 'self'; frame-ancestors 'none'"
+              return response
+          
+          @app.get('/')
+          def home():
+              return FileResponse(ROOT / 'static' / 'index.html')
+          
+          @app.get('/api/status')
+          def status():
+              return {'token': TOKEN, 'mode': 'Pretrained OCR + email/phone rules'}
+          
+          def open_image(upload):
+              data = upload.file.read(10 * 1024 * 1024 + 1)
+              if len(data) > 10 * 1024 * 1024:
+                  raise HTTPException(413, 'Maximum file size is 10 MB.')
+              try:
+                  source = Image.open(io.BytesIO(data))
+                  if source.format not in ('PNG', 'JPEG') or source.width * source.height > 12_000_000:
+                      raise HTTPException(400, 'Use a PNG or JPEG up to 12 megapixels.')
+                  rgba = ImageOps.exif_transpose(source).convert('RGBA')
+                  clean = Image.new('RGB', rgba.size, 'white')
+                  clean.paste(rgba, mask=rgba.getchannel('A'))
+                  return clean
+              except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError):
+                  raise HTTPException(400, 'The image cannot be opened.')
+          
+          def png_bytes(image):
+              output = io.BytesIO()
+              image.save(output, format='PNG')
+              return output.getvalue()
+          
+          def detect_boxes(image):
+              # OCR reads words and their image positions. It does not train a model.
+              with OCR_LOCK:
+                  data = pytesseract.image_to_data(image, lang='eng', config='--psm 11',
+                                                  output_type=pytesseract.Output.DICT, timeout=45)
+              lines = {}
+              for i, word in enumerate(data['text']):
+                  if word.strip():
+                      key = (data['block_num'][i], data['par_num'][i], data['line_num'][i])
+                      lines.setdefault(key, []).append(i)
+              patterns = {
+                  'EMAIL': r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}',
+                  'PHONE': r'(?<!\d)(?:\+92|0)3\d{2}[ -]?\d{7}(?!\d)',
+              }
+              boxes = []
+              for indices in lines.values():
+                  line, positions = '', []
+                  for i in indices:
+                      start = len(line)
+                      line += data['text'][i] + ' '
+                      positions.append((start, len(line) - 1, i))
+                  for label, pattern in patterns.items():
+                      for match in re.finditer(pattern, line):
+                          matched = [i for a, b, i in positions if a < match.end() and b > match.start()]
+                          x = max(0, min(data['left'][i] for i in matched) - 4)
+                          y = max(0, min(data['top'][i] for i in matched) - 4)
+                          right = min(image.width, max(data['left'][i] + data['width'][i] for i in matched) + 4)
+                          bottom = min(image.height, max(data['top'][i] + data['height'][i] for i in matched) + 4)
+                          boxes.append({'x': x, 'y': y, 'w': right-x, 'h': bottom-y, 'label': label})
+              return boxes
+          
+          @app.post('/api/analyze')
+          def analyze(file: UploadFile = File(...)):
+              image = open_image(file)
+              try:
+                  boxes = detect_boxes(image)
+              except pytesseract.TesseractNotFoundError:
+                  raise HTTPException(503, 'Install Tesseract OCR first. See README.md.')
+              except (pytesseract.TesseractError, RuntimeError):
+                  raise HTTPException(503, 'OCR failed or timed out. Try a smaller, clearer image.')
+              return {'image': base64.b64encode(png_bytes(image)).decode(), 'boxes': boxes}
+          
+          @app.post('/api/export')
+          def export(file: UploadFile = File(...), boxes: str = Form(...), reviewed: bool = Form(False)):
+              if not reviewed:
+                  raise HTTPException(400, 'Review the selected boxes before exporting.')
+              image = open_image(file)
+              try:
+                  selected = json.loads(boxes)
+                  if not isinstance(selected, list) or not 1 <= len(selected) <= 500:
+                      raise ValueError()
+                  draw = ImageDraw.Draw(image)
+                  for box in selected:
+                      x, y, w, h = [box[k] for k in ('x', 'y', 'w', 'h')]
+                      if any(type(v) is not int for v in (x, y, w, h)):
+                          raise ValueError()
+                      if x < 0 or y < 0 or w <= 0 or h <= 0 or x+w > image.width or y+h > image.height:
+                          raise ValueError()
+                      draw.rectangle((x, y, x+w-1, y+h-1), fill=(15, 23, 42))
+              except (ValueError, KeyError, TypeError):
+                  raise HTTPException(400, 'Provide valid redaction boxes inside the image.')
+              return Response(png_bytes(image), media_type='image/png',
+                              headers={'Content-Disposition': 'attachment; filename="sharesafe-redacted.png"'})
+          SHARESAFE_FILE_0_END
+          cat > ShareSafe/static/index.html <<'SHARESAFE_FILE_1_END'
+          <!doctype html>
+          <html lang="en">
+          <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+          <title>ShareSafe Mini</title><link rel="stylesheet" href="/static/style.css"></head>
+          <body><main>
+          <p class="brand">LA FABRICA</p><h1>ShareSafe Mini</h1>
+          <p>Find sensitive text in screenshots, review each box, and export a redacted copy.</p>
+          <section><label for="upload">Choose a PNG or JPEG</label>
+          <input id="upload" type="file" accept="image/png,image/jpeg">
+          <button id="scan" disabled>Detect emails and phones</button>
+          <p id="status" role="status">Choose an image to begin.</p></section>
+          <p>Drag on the image to add a manual box. Remove incorrect boxes below.</p>
+          <canvas id="canvas" aria-label="Screenshot redaction editor"></canvas>
+          <ul id="boxes"></ul>
+          <label><input id="review" type="checkbox"> I reviewed all boxes and checked for missed information.</label>
+          <p><button id="export" disabled>Download redacted PNG</button></p>
+          <footer>Local processing. Pretrained OCR and pattern rules. Review is required because detection can miss information.</footer>
+          </main><script src="/static/app.js"></script></body></html>
+          SHARESAFE_FILE_1_END
+          cat > ShareSafe/static/style.css <<'SHARESAFE_FILE_2_END'
+          *{box-sizing:border-box}body{margin:0;background:#f1f6f4;color:#123532;font:17px/1.6 system-ui,sans-serif}main{max-width:1080px;margin:40px auto;padding:24px}.brand{font-size:14px;font-weight:800;letter-spacing:3px;color:#087f74}h1{font-size:42px;margin:0}section{margin:24px 0;padding:20px;background:white;border-radius:12px}button{background:#087f74;color:white;border:0;border-radius:6px;padding:12px 18px;cursor:pointer;font:inherit}button:disabled{opacity:.45;cursor:default}input[type=file]{display:block;margin:12px 0}canvas{display:block;max-width:100%;height:auto;border:1px solid #aecbc3;touch-action:none}li{margin:8px 0}li button{margin-left:16px;padding:3px 12px}footer{font-size:14px;color:#526b65;margin-top:28px}
+          SHARESAFE_FILE_2_END
+          cat > ShareSafe/static/app.js <<'SHARESAFE_FILE_3_END'
+          const $ = id => document.getElementById(id);
+          const canvas = $('canvas'), ctx = canvas.getContext('2d');
+          let image = null, boxes = [], token = '', busy = false, start = null;
+          const controls = () => { $('scan').disabled = busy || !image; $('export').disabled = busy || !image || !boxes.length || !$('review').checked; $('upload').disabled = busy; document.querySelectorAll('#boxes button').forEach(b=>b.disabled=busy); };
+          function draw() {
+            if (!image) return;
+            ctx.drawImage(image,0,0);
+            ctx.fillStyle='rgba(15,23,42,.75)';ctx.strokeStyle='#10b981';ctx.lineWidth=2;
+            for (const b of boxes) { ctx.fillRect(b.x,b.y,b.w,b.h);ctx.strokeRect(b.x,b.y,b.w,b.h); }
+          }
+          function render() {
+            draw();$('boxes').replaceChildren();$('review').checked=false;
+            boxes.forEach((b,i) => { const li=document.createElement('li'), button=document.createElement('button');
+              li.textContent=`${i+1}. ${b.label}`;button.textContent='Remove';button.disabled=busy;
+              button.onclick=()=>{boxes.splice(i,1);render();};li.append(button);$('boxes').append(li); });controls();
+          }
+          async function loadImage(url) { const img=new Image();img.src=url;await img.decode();return img; }
+          async function api(path,form) {
+            if (!token) { const response=await fetch('/api/status');if(!response.ok)throw Error('Cannot connect to ShareSafe.');token=(await response.json()).token; }
+            const response=await fetch(path,{method:'POST',headers:{'X-ShareSafe-Token':token},body:form});
+            if (!response.ok) { const problem=await response.json().catch(()=>({}));throw Error(typeof problem.detail==='string'?problem.detail:'Request failed. Please retry.'); }
+            return response;
+          }
+          async function normalizedFile() {
+            const clean=document.createElement('canvas');clean.width=image.width;clean.height=image.height;
+            const c=clean.getContext('2d');c.fillStyle='white';c.fillRect(0,0,clean.width,clean.height);c.drawImage(image,0,0);
+            const blob=await new Promise(resolve=>clean.toBlob(resolve,'image/png'));
+            if(!blob)throw Error('Cannot prepare this image.');return blob;
+          }
+          $('upload').onchange=async()=>{
+            const file=$('upload').files[0];if(!file)return;busy=true;image=null;boxes=[];render();controls();
+            const url=URL.createObjectURL(file);
+            try { if(file.size>10*1024*1024)throw Error('Maximum file size is 10 MB.');const img=await loadImage(url);
+              if(img.width*img.height>12000000)throw Error('Maximum image size is 12 megapixels.');
+              image=img;canvas.width=image.width;canvas.height=image.height;$('status').textContent='Ready to detect. You can also draw boxes manually.';
+            } catch(e){ctx.clearRect(0,0,canvas.width,canvas.height);$('status').textContent=e.message;}
+            finally{URL.revokeObjectURL(url);busy=false;render();}
+          };
+          $('scan').onclick=async()=>{
+            if(busy||!image)return;busy=true;controls();$('status').textContent='Reading screenshot...';
+            try { const form=new FormData();form.append('file',await normalizedFile(),'screenshot.png');
+              const result=await(await api('/api/analyze',form)).json();
+              image=await loadImage('data:image/png;base64,'+result.image);canvas.width=image.width;canvas.height=image.height;
+              boxes=[...boxes.filter(b=>b.label==='MANUAL'),...result.boxes];$('status').textContent=`${result.boxes.length} automatic boxes. Review and add anything missed.`;
+            }catch(e){$('status').textContent=e.message;}finally{busy=false;render();}
+          };
+          function point(event){const r=canvas.getBoundingClientRect();return {x:Math.max(0,Math.min(canvas.width,Math.round((event.clientX-r.left)*canvas.width/r.width))),y:Math.max(0,Math.min(canvas.height,Math.round((event.clientY-r.top)*canvas.height/r.height)))};}
+          canvas.onpointerdown=e=>{if(!image||busy)return;start=point(e);canvas.setPointerCapture(e.pointerId);};
+          canvas.onpointermove=e=>{if(!start||busy)return;draw();const p=point(e);ctx.strokeRect(start.x,start.y,p.x-start.x,p.y-start.y);};
+          canvas.onpointerup=e=>{if(!start)return;const p=point(e),b={x:Math.min(start.x,p.x),y:Math.min(start.y,p.y),w:Math.abs(p.x-start.x),h:Math.abs(p.y-start.y),label:'MANUAL'};start=null;if(b.w>1&&b.h>1)boxes.push(b);render();};
+          canvas.onpointercancel=()=>{start=null;draw();};
+          $('review').onchange=controls;
+          $('export').onclick=async()=>{
+            if(busy||!image||!$('review').checked)return;busy=true;controls();
+            try {const form=new FormData();form.append('file',await normalizedFile(),'screenshot.png');form.append('boxes',JSON.stringify(boxes));form.append('reviewed','true');
+              const blob=await(await api('/api/export',form)).blob(),url=URL.createObjectURL(blob),a=document.createElement('a');
+              a.href=url;a.download='sharesafe-redacted.png';a.click();setTimeout(()=>URL.revokeObjectURL(url),10000);$('status').textContent='Redacted PNG exported.';
+            }catch(e){$('status').textContent=e.message;}finally{busy=false;controls();}
+          };
+          SHARESAFE_FILE_3_END
+          cat > ShareSafe/requirements.txt <<'SHARESAFE_FILE_4_END'
+          fastapi>=0.115,<1
+          uvicorn>=0.30,<1
+          python-multipart>=0.0.18,<1
+          Pillow>=11,<13
+          pytesseract>=0.3.13,<0.4
+          SHARESAFE_FILE_4_END
+          cat > ShareSafe/start_windows.bat <<'SHARESAFE_FILE_5_END'
+          @echo off
+          cd /d "%~dp0"
+          if not exist .venv\Scripts\python.exe (
+            py -3.11 -m venv .venv
+            if errorlevel 1 goto failed
+          )
+          .venv\Scripts\python.exe -m pip install -r requirements.txt
+          if errorlevel 1 goto failed
+          echo Open http://127.0.0.1:8000 in your browser.
+          .venv\Scripts\python.exe -m uvicorn app:app --host 127.0.0.1 --port 8000 --no-access-log
+          pause
+          exit /b
+          :failed
+          echo Setup failed. Install Python 3.11 and check your internet connection.
+          pause
+          exit /b 1
+          SHARESAFE_FILE_5_END
+          cat > ShareSafe/tests/test_app.py <<'SHARESAFE_FILE_6_END'
+          import io
+          import unittest
+          from fastapi.testclient import TestClient
+          from PIL import Image, ImageDraw, ImageFont
+          from app import app
+          
+          class ShareSafeTests(unittest.TestCase):
+              def setUp(self):
+                  self.client = TestClient(app)
+                  self.headers = {'X-ShareSafe-Token': self.client.get('/api/status').json()['token']}
+          
+              def image(self, text=''):
+                  image = Image.new('RGB', (1000, 180), 'white')
+                  if text:
+                      ImageDraw.Draw(image).text((30, 55), text, font=ImageFont.load_default(size=36), fill='black')
+                  data = io.BytesIO()
+                  image.save(data, format='PNG')
+                  return data.getvalue()
+          
+              def test_real_ocr_email(self):
+                  response = self.client.post('/api/analyze', headers=self.headers,
+                      files={'file': ('sample.png', self.image('Email: alex@example.com'), 'image/png')})
+                  self.assertEqual(response.status_code, 200, response.text)
+                  self.assertIn('EMAIL', [b['label'] for b in response.json()['boxes']])
+          
+              def test_redaction_pixels(self):
+                  response = self.client.post('/api/export', headers=self.headers,
+                      files={'file': ('sample.png', self.image(), 'image/png')},
+                      data={'boxes': '[{"x":10,"y":10,"w":40,"h":20}]', 'reviewed': 'true'})
+                  self.assertEqual(response.status_code, 200)
+                  image = Image.open(io.BytesIO(response.content))
+                  self.assertEqual(image.getpixel((20, 20)), (15, 23, 42))
+                  self.assertEqual(image.getpixel((80, 80)), (255, 255, 255))
+          
+              def test_review_required(self):
+                  response = self.client.post('/api/export', headers=self.headers,
+                      files={'file': ('sample.png', self.image(), 'image/png')}, data={'boxes': '[]'})
+                  self.assertEqual(response.status_code, 400)
+          
+              def test_session_token_required(self):
+                  self.assertEqual(self.client.post('/api/analyze').status_code, 403)
+          
+              def test_invalid_image(self):
+                  response = self.client.post('/api/analyze', headers=self.headers,
+                      files={'file': ('bad.png', b'not an image', 'image/png')})
+                  self.assertEqual(response.status_code, 400)
+          
+              def test_invalid_boxes(self):
+                  response = self.client.post('/api/export', headers=self.headers,
+                      files={'file': ('sample.png', self.image(), 'image/png')},
+                      data={'boxes': '[{"x":-1,"y":0,"w":50,"h":20}]', 'reviewed': 'true'})
+                  self.assertEqual(response.status_code, 400)
+          
+          if __name__ == '__main__':
+              unittest.main()
+          SHARESAFE_FILE_6_END
+          cat > ShareSafe/README.md <<'SHARESAFE_FILE_7_END'
+          # ShareSafe Mini — La Fabrica
+          
+          A small working screenshot redaction app created from a self-contained YAML workflow.
+          
+          ## What this version does
+          
+          - Upload a PNG or JPEG, up to 10 MB and 12 megapixels.
+          - Use pretrained English Tesseract OCR to locate text.
+          - Suggest masks for emails and supported Pakistan mobile-number formats.
+          - Draw manual boxes and remove unwanted boxes.
+          - Review and download a new PNG with solid pixel masks.
+          
+          This is a smaller teaching version of ShareSafe, not the complete earlier prototype.
+          It does not include name detection, CNIC, IP or secret rules, model training,
+          adaptive OCR retries, accounts, or online deployment. No accuracy claim is made.
+          Review every image, including areas that OCR did not detect.
+          
+          ## Run on Windows
+          
+          1. Extract the downloaded artifact ZIP into a folder.
+          2. Install Python 3.11 with the Python launcher.
+          3. Install Tesseract with English data using the Windows installer linked by
+             the official documentation: https://tesseract-ocr.github.io/tessdoc/Installation.html
+          4. The default supported location is `C:\Program Files\Tesseract-OCR\tesseract.exe`.
+             For another location, set the environment variable `TESSERACT_CMD` to that executable.
+          5. Double-click `start_windows.bat`. Internet is required to install Python packages.
+          6. Open http://127.0.0.1:8000 and select a fictional screenshot.
+          
+          ## Run on Ubuntu
+          
+          ```bash
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-eng python3-venv
+          python3 -m venv .venv
+          source .venv/bin/activate
+          python -m pip install -r requirements.txt
+          python -m uvicorn app:app --host 127.0.0.1 --port 8000 --no-access-log
+          ```
+          
+          ## Test
+          
+          ```bash
+          python -m pip install httpx
+          python -m unittest discover -s tests -v
+          ```
+          
+          
+
+      # STEP 3: Install the OCR engine and Python packages.
+      - name: Install project dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-eng
+          python -m pip install -r ShareSafe/requirements.txt httpx
+
+      # STEP 4: Check syntax and run real OCR and redaction tests.
+      - name: Test the generated project
+        working-directory: ShareSafe
+        run: |
+          python -m py_compile app.py
+          python -m unittest discover -s tests -v
+
+      # STEP 5: Save the project as a downloadable ZIP artifact.
+      # No server is deployed and no files are committed to the repository.
+      - name: Save downloadable project
+        uses: actions/upload-artifact@v4
+        with:
+          name: ShareSafe-Generated
+          path: |
+            ShareSafe/app.py
+            ShareSafe/static/
+            ShareSafe/requirements.txt
+            ShareSafe/start_windows.bat
+            ShareSafe/tests/test_app.py
+            ShareSafe/README.md
+          if-no-files-found: error
+          retention-days: 7
 
